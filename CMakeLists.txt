@@ -1,137 +1,121 @@
-cmake_minimum_required(VERSION 3.5)
+cmake_minimum_required(VERSION 3.8)
 project(mrs_bumper)
 
-set(CATKIN_DEPENDENCIES
-  cmake_modules
-  cv_bridge
-  dynamic_reconfigure
-  geometry_msgs
-  image_geometry
-  image_transport
-  message_runtime
-  mrs_lib
-  mrs_msgs
-  nodelet
-  pcl_conversions
-  pcl_msgs
-  pcl_ros
-  roscpp
-  sensor_msgs
-  tf2_geometry_msgs
-  tf2_ros
-  )
+# Default to C++17
+if(NOT CMAKE_CXX_STANDARD)
+  set(CMAKE_CXX_STANDARD 17)
+endif()
+if(CMAKE_CXX_STANDARD LESS 17)
+  message(FATAL_ERROR "This project requires C++17 or higher")
+endif()
 
-find_package(catkin REQUIRED COMPONENTS
-  ${CATKIN_DEPENDENCIES}
-  )
-
-# include Eigen3
-find_package(Eigen3 REQUIRED)
-set(Eigen_INCLUDE_DIRS ${EIGEN3_INCLUDE_DIRS})
-set(Eigen_LIBRARIES ${EIGEN3_LIBRARIES})
-
-# add_definitions("-fdiagnostics-color=always -O0 -g -DEIGEN_INITIALIZE_MATRICES_BY_NAN")
-
-set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-add_compile_options("-Wall")
-add_compile_options("-Wextra")
-add_compile_options(${PCL_COMPILE_OPTIONS})
-
-# remove warning info from PCL
-set(PCL_FIND_QUIETLY INTERNAL)
-
+# Find dependencies
+find_package(ament_cmake REQUIRED)
+find_package(rclcpp REQUIRED)
+find_package(rclcpp_components REQUIRED)
+find_package(sensor_msgs REQUIRED)
+find_package(geometry_msgs REQUIRED)
+find_package(cv_bridge REQUIRED)
+find_package(image_transport REQUIRED)
+find_package(image_geometry REQUIRED)
+find_package(tf2_ros REQUIRED)
+find_package(tf2_geometry_msgs REQUIRED)
+find_package(mrs_lib REQUIRED)
+find_package(mrs_msgs REQUIRED)
+find_package(PCL REQUIRED)
+find_package(pcl_conversions REQUIRED)
+find_package(pcl_ros REQUIRED)
+find_package(pcl_msgs REQUIRED)
 find_package(OpenCV REQUIRED)
+find_package(Eigen3 REQUIRED)
 
-find_package(PCL REQUIRED COMPONENTS)
+# Compile options
+add_compile_options(-Wall -Wextra)
 
-generate_dynamic_reconfigure_options(
-  config/Bumper.cfg
-  )
+set(dependencies
+  rclcpp
+  rclcpp_components
+  sensor_msgs
+  geometry_msgs
+  cv_bridge
+  image_transport
+  image_geometry
+  tf2_ros
+  tf2_geometry_msgs
+  mrs_lib
+  mrs_msgs
+  pcl_conversions
+  pcl_ros
+  pcl_msgs
+)
 
-set(EXECUTABLES
-  histogram_displayer
-  )
-
-set(LIBRARIES
-  MrsBumper_Bumper
-  )
-
-catkin_package(
-  CATKIN_DEPENDS ${CATKIN_DEPENDENCIES}
-  LIBRARIES ${LIBRARIES}
-  )
-
-## --------------------------------------------------------------
-## |                            Build                           |
-## --------------------------------------------------------------
-
-include_directories(include
-  ${catkin_INCLUDE_DIRS}
-  ${OpenCV_INCLUDE_DIRS}
-  ${Eigen_INCLUDE_DIRS}
-  ${PCL_INCLUDE_DIRS}
-  # ~/git/darknet_ocl/src
-  )
-
-# bumper
-
-add_library(MrsBumper_Bumper
+# Build library
+add_library(mrs_bumper_lib SHARED
   src/bumper_nodelet.cpp
-  )
+)
 
-add_dependencies(MrsBumper_Bumper
-  ${${PROJECT_NAME}_EXPORTED_TARGETS}
-  ${catkin_EXPORTED_TARGETS}
-  )
+ament_target_dependencies(mrs_bumper_lib ${dependencies})
 
-target_link_libraries(MrsBumper_Bumper
-  ${catkin_LIBRARIES}
+target_include_directories(mrs_bumper_lib PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>
+  ${mrs_lib_INCLUDE_DIRS}
+)
+
+target_link_libraries(mrs_bumper_lib
   ${OpenCV_LIBRARIES}
   ${PCL_LIBRARIES}
-  )
+  Eigen3::Eigen
+)
 
-# histogram displayer
+# Register component
+rclcpp_components_register_node(mrs_bumper_lib
+  PLUGIN "mrs_bumper::Bumper"
+  EXECUTABLE mrs_bumper_node
+)
 
+# Build executable
 add_executable(histogram_displayer
   src/histogram_displayer.cpp
-  )
+)
 
-add_dependencies(histogram_displayer
-  ${${PROJECT_NAME}_EXPORTED_TARGETS}
-  ${catkin_EXPORTED_TARGETS}
-  )
+ament_target_dependencies(histogram_displayer
+  rclcpp
+  mrs_lib
+  mrs_msgs
+)
+
+target_include_directories(histogram_displayer PRIVATE
+  ${mrs_lib_INCLUDE_DIRS}
+)
 
 target_link_libraries(histogram_displayer
-  ${catkin_LIBRARIES}
   ${OpenCV_LIBRARIES}
-  )
+)
 
-## --------------------------------------------------------------
-## |                           Install                          |
-## --------------------------------------------------------------
+# Install
+install(TARGETS
+  mrs_bumper_lib
+  ARCHIVE DESTINATION lib
+  LIBRARY DESTINATION lib
+  RUNTIME DESTINATION bin
+)
 
-install(TARGETS ${LIBRARIES}
-  ARCHIVE DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
-  LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
-  RUNTIME DESTINATION ${CATKIN_GLOBAL_BIN_DESTINATION}
-  )
-
-install(TARGETS ${EXECUTABLES}
-  RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
-  )
+install(TARGETS
+  histogram_displayer
+  RUNTIME DESTINATION lib/${PROJECT_NAME}
+)
 
 install(DIRECTORY launch config
-  DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}
-  )
+  DESTINATION share/${PROJECT_NAME}
+)
 
-install(FILES nodelets.xml
-  DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}
-  )
+install(FILES
+  DESTINATION share/${PROJECT_NAME}
+)
 
-install(DIRECTORY tmux/
-  USE_SOURCE_PERMISSIONS
-  DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}/tmux
-  )
+# Ament package
+ament_package()

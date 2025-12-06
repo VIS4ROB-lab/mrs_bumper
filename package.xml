@@ -1,8 +1,8 @@
 <?xml version="1.0"?>
-<package format="2">
+<package format="3">
 
   <name>mrs_bumper</name>
-  <version>1.0.4</version>
+  <version>2.0.0</version>
   <description>Program for publishing bumper messages for reactive collision avoidance</description>
 
   <author email="vrbamato@fel.cvut.cz">Matouš Vrba</author>
@@ -10,28 +10,27 @@
 
   <license>BSD 3-Clause</license>
 
-  <buildtool_depend>catkin</buildtool_depend>
+  <buildtool_depend>ament_cmake</buildtool_depend>
 
-  <depend>cmake_modules</depend>
   <depend>cv_bridge</depend>
-  <depend>dynamic_reconfigure</depend>
   <depend>geometry_msgs</depend>
   <depend>image_geometry</depend>
   <depend>image_transport</depend>
-  <depend>message_runtime</depend>
   <depend>mrs_lib</depend>
   <depend>mrs_msgs</depend>
-  <depend>nodelet</depend>
   <depend>pcl_conversions</depend>
   <depend>pcl_msgs</depend>
   <depend>pcl_ros</depend>
-  <depend>roscpp</depend>
+  <depend>rclcpp</depend>
+  <depend>rclcpp_components</depend>
   <depend>sensor_msgs</depend>
   <depend>tf2_geometry_msgs</depend>
   <depend>tf2_ros</depend>
+  <depend>opencv-cmake-modules</depend>
 
-  <export>
-    <nodelet plugin="${prefix}/nodelets.xml" />
-  </export>
+  <exec_depend>ros2launch</exec_depend>
+
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_lint_common</test_depend>
 
 </package>
