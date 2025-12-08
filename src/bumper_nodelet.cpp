@@ -739,8 +739,25 @@ class Bumper : public rclcpp::Node {
     std::vector<double> ret(m_n_total_sectors,
                             ObstacleSectors::OBSTACLE_NO_DATA);
 
+    // Transform the pointcloud to m_frame_id before processing
+    sensor_msgs::msg::PointCloud2::ConstSharedPtr cloud_msg_transformed;
+    if (cloud_msg_ptr->header.frame_id != m_frame_id) {
+      const auto transformed_opt =
+          m_tfm->transformSingle(cloud_msg_ptr, m_frame_id);
+      if (!transformed_opt.has_value()) {
+        RCLCPP_WARN_THROTTLE(
+            this->get_logger(), *this->get_clock(), 1000,
+            "[Bumper]: Failed to transform pointcloud from '%s' to '%s'",
+            cloud_msg_ptr->header.frame_id.c_str(), m_frame_id.c_str());
+        return ret;
+      }
+      cloud_msg_transformed = transformed_opt.value();
+    } else {
+      cloud_msg_transformed = cloud_msg_ptr;
+    }
+
     auto cloud_orig = pcl::make_shared<pc_t>();
-    pcl::fromROSMsg(*cloud_msg_ptr, *cloud_orig);
+    pcl::fromROSMsg(*cloud_msg_transformed, *cloud_orig);
     auto cloud = pcl::make_shared<pc_t>();
 
     // reduce the number of points using VoxelGrid (output to cloud)
@@ -793,7 +810,7 @@ class Bumper : public rclcpp::Node {
 
     sensor_msgs::msg::PointCloud2 cloud_msg;
     pcl::toROSMsg(*cloud, cloud_msg);
-    cloud_msg.header = cloud_msg_ptr->header;
+    cloud_msg.header = cloud_msg_transformed->header;
     m_lidar3d_processed.publish(cloud_msg);
 
     for (const auto& el : *cloud) {
