@@ -3,9 +3,10 @@
 /* headers //{ */
 
 // clang: MatousFormat
-#include <cv_bridge/cv_bridge.h>
-#include <image_geometry/pinhole_camera_model.h>
+#include <mrs_lib/dynparam_mgr.h>
 #include <mrs_lib/geometry/cyclic.h>
+#include <mrs_lib/mutex.h>
+#include <mrs_lib/node.h>
 #include <mrs_lib/param_loader.h>
 #include <mrs_lib/publisher_handler.h>
 #include <mrs_lib/subscriber_handler.h>
@@ -20,21 +21,17 @@
 
 #include <algorithm>
 #include <boost/circular_buffer.hpp>
-#include <geometry_msgs/msg/vector3.hpp>
-#include <geometry_msgs/msg/vector3_stamped.hpp>
+#include <cv_bridge/cv_bridge.hpp>
+#include <image_geometry/pinhole_camera_model.hpp>
 #include <image_transport/image_transport.hpp>
 #include <mrs_msgs/msg/histogram.hpp>
 #include <mrs_msgs/msg/obstacle_sectors.hpp>
 #include <opencv2/highgui/highgui.hpp>
 #include <opencv2/imgproc/imgproc.hpp>
-#include <rclcpp/rclcpp.hpp>
-#include <rclcpp_components/register_node_macro.hpp>
-#include <sensor_msgs/msg/camera_info.hpp>
-#include <sensor_msgs/msg/image.hpp>
 #include <sensor_msgs/msg/laser_scan.hpp>
-#include <sensor_msgs/msg/point_cloud2.hpp>
 #include <sensor_msgs/msg/range.hpp>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
+#include <tf2_sensor_msgs/tf2_sensor_msgs.hpp>
 
 //}
 
@@ -49,18 +46,86 @@ using vec3_t = Eigen::Vector3f;
 
 using radians = mrs_lib::geometry::radians;
 
-class Bumper : public rclcpp::Node {
+/* DynParams_t //{ */
+
+struct DynParams_t {
+  int structuring_element_a;
+  int structuring_element_b;
+  int dilate_iterations;
+  int erode_iterations;
+  int erode_ignore_empty_iterations;
+  int histogram_n_bins;
+  int histogram_quantile_area;
+  double max_depth;
+  int median_filter_size;
+  double update_rate;
+};
+
+//}
+
+class Bumper : public mrs_lib::Node {
  public:
-  /* Constructor //{ */
-  explicit Bumper(const rclcpp::NodeOptions& options)
-      : rclcpp::Node("bumper", options) {
-    auto node_handle = rclcpp::Node::SharedPtr(this, [](rclcpp::Node*) {});
-    m_node_name = "Bumper";
+  /* Bumper() constructor //{ */
+  Bumper(const rclcpp::NodeOptions& options)
+      : mrs_lib::Node("Bumper", options) {
+    node = this->this_node_ptr();
+    clock = node->get_clock();
 
     /* Load parameters from ROS //{*/
-    mrs_lib::ParamLoader pl(node_handle, m_node_name);
+    mrs_lib::ParamLoader pl(node);
+
+    // load custom config
+    std::string custom_config_path;
+
+    pl.loadParam("custom_config", custom_config_path);
+
+    if (custom_config_path != "") {
+      RCLCPP_INFO(node->get_logger(), "loading custom config '%s",
+                  custom_config_path.c_str());
+      pl.addYamlFile(custom_config_path);
+    }
+
+    // load main config
+    pl.addYamlFileFromParam("config");
+
+    // Dynparam_mgr has its own param loader.
+    m_drmgr_ptr =
+        std::make_shared<mrs_lib::DynparamMgr>(node, mutex_drs_params_);
+    m_drmgr_ptr->get_param_provider().copyYamls(pl.getParamProvider());
+
+    m_drmgr_ptr->register_param("structuring_element_a",
+                                &drs_params_.structuring_element_a,
+                                mrs_lib::DynparamMgr::range_t<int>(1, 10));
+    m_drmgr_ptr->register_param("structuring_element_b",
+                                &drs_params_.structuring_element_b,
+                                mrs_lib::DynparamMgr::range_t<int>(1, 10));
+    m_drmgr_ptr->register_param("dilate_iterations",
+                                &drs_params_.dilate_iterations,
+                                mrs_lib::DynparamMgr::range_t<int>(0, 10));
+    m_drmgr_ptr->register_param("erode_iterations",
+                                &drs_params_.erode_iterations,
+                                mrs_lib::DynparamMgr::range_t<int>(0, 10));
+    m_drmgr_ptr->register_param("erode_ignore_empty_iterations",
+                                &drs_params_.erode_ignore_empty_iterations,
+                                mrs_lib::DynparamMgr::range_t<int>(0, 10));
+    m_drmgr_ptr->register_param("histogram_n_bins",
+                                &drs_params_.histogram_n_bins,
+                                mrs_lib::DynparamMgr::range_t<int>(1, 10000));
+    m_drmgr_ptr->register_param("histogram_quantile_area",
+                                &drs_params_.histogram_quantile_area,
+                                mrs_lib::DynparamMgr::range_t<int>(1, 10000));
+    m_drmgr_ptr->register_param(
+        "max_depth", &drs_params_.max_depth,
+        mrs_lib::DynparamMgr::range_t<double>(0.0, 65.535));
+    m_drmgr_ptr->register_param("median_filter_size",
+                                &drs_params_.median_filter_size,
+                                mrs_lib::DynparamMgr::range_t<int>(1, 100));
+    m_drmgr_ptr->register_param(
+        "update_rate", &drs_params_.update_rate,
+        mrs_lib::DynparamMgr::range_t<double>(1.0, 100.0));
+
     // LOAD STATIC PARAMETERS
-    RCLCPP_INFO(this->get_logger(), "[Bumper]: Loading static parameters:");
+    RCLCPP_INFO(node->get_logger(), "Loading static parameters:");
     const auto uav_name = pl.loadParam2<std::string>("uav_name");
     pl.loadParam("update_rate", m_update_rate, 10.0);
     pl.loadParam("frame_id", m_frame_id);
@@ -103,65 +168,62 @@ class Bumper : public rclcpp::Node {
     // LOAD DYNAMIC PARAMETERS
     // CHECK LOADING STATUS
     if (!pl.loadedSuccessfully()) {
-      RCLCPP_ERROR(
-          this->get_logger(),
-          "Some compulsory parameters were not loaded successfully, ending the "
-          "node");
+      RCLCPP_ERROR(node->get_logger(),
+                   "Some compulsory parameters were not loaded successfully, "
+                   "ending the node");
       rclcpp::shutdown();
     }
 
-    // Dynamic reconfigure not supported in ROS2
     //}
 
     /* Create publishers and subscribers //{ */
     // Initialize subscribers
-    mrs_lib::SubscriberHandlerOptions shopts(
-        std::dynamic_pointer_cast<rclcpp::Node>(node_handle));
-    shopts.node_name = "Bumper";
+    mrs_lib::SubscriberHandlerOptions shopts;
+    shopts.node = node;
 
-    mrs_lib::construct_object(m_depthmap_sh, shopts, "depthmap_in");
-    mrs_lib::construct_object(m_depth_cinfo_sh, shopts, "depth_cinfo_in");
-    mrs_lib::construct_object(m_lidar3d_sh, shopts, "lidar3d_in");
-    mrs_lib::construct_object(m_lidar2d_sh, shopts, "lidar2d_in");
-    mrs_lib::construct_object(m_lidar1d_down_sh, shopts, "lidar1d_down_in");
-    mrs_lib::construct_object(m_lidar1d_up_sh, shopts, "lidar1d_up_in");
+    mrs_lib::construct_object(m_depthmap_sh, shopts, "~/depthmap_in");
+    mrs_lib::construct_object(m_depth_cinfo_sh, shopts, "~/depth_cinfo_in");
+    mrs_lib::construct_object(m_lidar3d_sh, shopts, "~/lidar3d_in");
+    mrs_lib::construct_object(m_lidar2d_sh, shopts, "~/lidar2d_in");
+    mrs_lib::construct_object(m_lidar1d_down_sh, shopts, "~/lidar1d_down_in");
+    mrs_lib::construct_object(m_lidar1d_up_sh, shopts, "~/lidar1d_up_in");
+
+    mrs_lib::PublisherHandlerOptions phopts;
+    phopts.node = node;
 
     // Initialize publishers
     m_obstacles_pub = mrs_lib::PublisherHandler<ObstacleSectors>(
-        node_handle, "obstacle_sectors");
+        phopts, "~/obstacle_sectors");
     m_processed_depthmap_pub =
         mrs_lib::PublisherHandler<sensor_msgs::msg::Image>(
-            node_handle, "processed_depthmap");
+            phopts, "~/processed_depthmap");
     m_depthmap_hist_pub =
-        mrs_lib::PublisherHandler<Histogram>(node_handle, "depthmap_histogram");
+        mrs_lib::PublisherHandler<Histogram>(phopts, "~/depthmap_histogram");
     m_lidar3d_processed =
         mrs_lib::PublisherHandler<sensor_msgs::msg::PointCloud2>(
-            node_handle, "lidar3d_processed");
+            phopts, "~/lidar3d_processed");
 
-    m_tf_buffer = std::make_unique<tf2_ros::Buffer>(this->get_clock());
-    m_tf_listener_ptr = std::make_unique<tf2_ros::TransformListener>(
-        *m_tf_buffer, node_handle, false);
+    // initialize tf buffer with node clock and start transform listener
+    m_tf_buffer = std::make_unique<tf2_ros::Buffer>(clock);
+    m_tf_listener_ptr =
+        std::make_unique<tf2_ros::TransformListener>(*m_tf_buffer);
     //}
 
     /* Initialize other varibles //{ */
-    const std::string node_name_str(this->get_name());
     if (path_to_mask.empty()) {
-      RCLCPP_INFO(this->get_logger(), "[%s]: Not using image mask",
-                  node_name_str.c_str());
+      RCLCPP_INFO(node->get_logger(), "Not using image mask");
     } else {
       m_depthmap_mask_im = cv::imread(path_to_mask, cv::IMREAD_GRAYSCALE);
       if (m_depthmap_mask_im.empty()) {
-        RCLCPP_ERROR(
-            this->get_logger(),
-            "[%s]: Error loading image mask from file '%s'! Ending node.",
-            node_name_str.c_str(), path_to_mask.c_str());
+        RCLCPP_ERROR(node->get_logger(),
+                     "Error loading image mask from file '%s'! Ending node.",
+                     path_to_mask.c_str());
         rclcpp::shutdown();
       } else if (m_depthmap_mask_im.type() != CV_8UC1) {
-        RCLCPP_ERROR(
-            this->get_logger(),
-            "[%s]: Loaded image mask has unexpected type: '%u' (expected %u)! "
-            "Ending node.",
-            node_name_str.c_str(), m_depthmap_mask_im.type(), CV_8UC1);
+        RCLCPP_ERROR(node->get_logger(),
+                     "Loaded image mask has unexpected type: '%u' (expected "
+                     "%u)! Ending node.",
+                     m_depthmap_mask_im.type(), CV_8UC1);
         rclcpp::shutdown();
       }
     }
@@ -169,14 +231,12 @@ class Bumper : public rclcpp::Node {
     if (fallback_timeout != 0.0) {
       if (m_fallback_n_horizontal_sectors == 0 ||
           m_fallback_vertical_fov == 0.0) {
-        RCLCPP_ERROR(
-            this->get_logger(),
-            "[%s]: Fallback timeout was specified, but fallback number of "
-            "horizontal sectors (%d) or fallback vertical field of view (%.2f) "
-            "is invalid (both "
-            "have to be > 0). Ending node.",
-            m_node_name.c_str(), m_fallback_n_horizontal_sectors,
-            m_fallback_vertical_fov);
+        RCLCPP_ERROR(node->get_logger(),
+                     "Fallback timeout was specified, but fallback number of "
+                     "horizontal sectors (%d) or fallback vertical field of "
+                     "view (%.2f) is invalid (both "
+                     "have to be > 0). Ending node.",
+                     m_fallback_n_horizontal_sectors, m_fallback_vertical_fov);
         rclcpp::shutdown();
       }
     }
@@ -187,12 +247,12 @@ class Bumper : public rclcpp::Node {
     m_sectors_initialized = false;
     m_lidar2d_offset_initialized = false;
 
-    m_tfm = std::make_unique<mrs_lib::Transformer>(node_handle);
+    m_tfm = std::make_unique<mrs_lib::Transformer>(node);
     m_tfm->setDefaultPrefix(uav_name);
     m_tfm->retryLookupNewest(true);
     //}
 
-    m_main_loop_timer = this->create_wall_timer(
+    m_main_loop_timer = node->create_wall_timer(
         std::chrono::duration<double>(1.0 / m_update_rate),
         std::bind(&Bumper::main_loop, this));
 
@@ -208,9 +268,8 @@ class Bumper : public rclcpp::Node {
     /* Initialize number of horizontal sectors etc from camera info message //{
      */
     if (!m_sectors_initialized && m_depth_cinfo_sh.hasMsg()) {
-      RCLCPP_INFO(
-          this->get_logger(),
-          "[Bumper]: Processing camera info message to initialize sectors");
+      RCLCPP_INFO(node->get_logger(),
+                  "Processing camera info message to initialize sectors");
 
       const auto cinfo = m_depth_cinfo_sh.getMsg();
       initialize_roi(cinfo->width, cinfo->height);
@@ -224,66 +283,60 @@ class Bumper : public rclcpp::Node {
       const int n_horizontal_sectors = std::ceil(2.0 * M_PI / horizontal_fov);
       initialize_sectors(n_horizontal_sectors, vertical_fov);
 
-      RCLCPP_INFO(this->get_logger(),
-                  "[Bumper]: Depth camera horizontal FOV: %.1fdeg",
+      RCLCPP_INFO(node->get_logger(), "Depth camera horizontal FOV: %.1fdeg",
                   horizontal_fov / M_PI * 180.0);
-      RCLCPP_INFO(this->get_logger(),
-                  "[Bumper]: Depth camera vertical FOV: %.1fdeg",
+      RCLCPP_INFO(node->get_logger(), "Depth camera vertical FOV: %.1fdeg",
                   vertical_fov / M_PI * 180.0);
-      RCLCPP_INFO(this->get_logger(),
-                  "[Bumper]: Number of horizontal sectors: %d",
+      RCLCPP_INFO(node->get_logger(), "Number of horizontal sectors: %d",
                   m_n_horizontal_sectors);
     }
     //}
 
     /* Initialize horizontal angle offset of 2D lidar from a new message //{ */
     if (!m_lidar2d_offset_initialized && m_lidar2d_sh.hasMsg()) {
-      RCLCPP_INFO(this->get_logger(),
-                  "[Bumper]: Initializing 2D lidar horizontal angle offset");
+      RCLCPP_INFO_THROTTLE(node->get_logger(), *clock, 1000,
+                           "Initializing 2D lidar horizontal angle offset");
 
       const auto lidar2d_msg = m_lidar2d_sh.getMsg();
       initialize_lidar2d_offset(lidar2d_msg);
 
       if (m_lidar2d_offset_initialized)
-        RCLCPP_INFO(this->get_logger(),
-                    "[Bumper]: 2D lidar horizontal angle offset: %.2f",
-                    m_lidar2d_offset);
+        RCLCPP_INFO(node->get_logger(),
+                    "2D lidar horizontal angle offset: %.2f", m_lidar2d_offset);
       else
-        RCLCPP_WARN(this->get_logger(),
-                    "[Bumper]: 2D lidar horizontal angle offset "
-                    "initialization failed, will retry.");
+        RCLCPP_WARN_THROTTLE(node->get_logger(), *clock, 1000,
+                             "2D lidar horizontal angle offset initialization "
+                             "failed, will retry.");
     }
     //}
 
     //}
 
+    auto drs_params = mrs_lib::get_mutexed(mutex_drs_params_, drs_params_);
     /* apply changes from dynamic reconfigure //{ */
-    if (m_median_filter_size != 1) {
-      if (1 > 0) {
-        m_median_filter_size = 1;
+    if (m_median_filter_size != drs_params.median_filter_size) {
+      if (drs_params.median_filter_size > 0) {
+        m_median_filter_size = drs_params.median_filter_size;
         update_filter_sizes();
       } else {
         RCLCPP_ERROR(
-            this->get_logger(),
-            "[Bumper]: Size of median filter cannot be <= 0: %d! Ignoring new "
-            "value.",
-            1);
+            node->get_logger(),
+            "Size of median filter cannot be <= 0: %d! Ignoring new value.",
+            drs_params.median_filter_size);
       }
     }
 
-    if (m_update_rate != 10.0) {
-      if (10.0 > 0.0) {
-        m_update_rate = 10.0;
-        // Recreate timer with new period
-        m_main_loop_timer.reset();
-        m_main_loop_timer = this->create_wall_timer(
+    if (m_update_rate != drs_params.update_rate) {
+      if (drs_params.update_rate > 0.0) {
+        m_update_rate = drs_params.update_rate;
+        m_main_loop_timer->cancel();
+        m_main_loop_timer = node->create_wall_timer(
             std::chrono::duration<double>(1.0 / m_update_rate),
             std::bind(&Bumper::main_loop, this));
       } else {
-        RCLCPP_ERROR(
-            this->get_logger(),
-            "[Bumper]: Update rate cannot be <= 0: %lf! Ignoring new value.",
-            10.0);
+        RCLCPP_ERROR(node->get_logger(),
+                     "Update rate cannot be <= 0: %lf! Ignoring new value.",
+                     drs_params.update_rate);
       }
     }
     //}
@@ -301,18 +354,20 @@ class Bumper : public rclcpp::Node {
         if (!m_depthmap_roi_initialized)
           initialize_roi(source_msg->image.cols, source_msg->image.rows);
         const auto obstacle_sectors = find_obstacles_depthmap(source_msg);
-        sensors_sectors.push_back({ObstacleSectors::SENSOR_DEPTH,
-                                   obstacle_sectors, source_msg->header.stamp});
+        const rclcpp::Time msg_stamp = rclcpp::Time(source_msg->header.stamp);
+        sensors_sectors.emplace_back(ObstacleSectors::SENSOR_DEPTH,
+                                     obstacle_sectors, msg_stamp);
         sensors_topics.push_back(m_depthmap_sh.topicName());
       }
 
       // Check data from the 3D lidar
       if (m_lidar3d_sh.newMsg()) {
-        const auto cloud = m_lidar3d_sh.getMsg();
-        std::vector<double> obstacle_sectors = find_obstacles_pointcloud(cloud);
-        const rclcpp::Time msg_stamp(cloud->header.stamp);
-        sensors_sectors.push_back(
-            {ObstacleSectors::SENSOR_LIDAR3D, obstacle_sectors, msg_stamp});
+        const auto cloud_msg = m_lidar3d_sh.getMsg();
+        std::vector<double> obstacle_sectors =
+            find_obstacles_pointcloud(cloud_msg);
+        const rclcpp::Time msg_stamp = rclcpp::Time(cloud_msg->header.stamp);
+        sensors_sectors.emplace_back(ObstacleSectors::SENSOR_LIDAR3D,
+                                     obstacle_sectors, msg_stamp);
         sensors_topics.push_back(m_lidar3d_sh.topicName());
       }
 
@@ -320,8 +375,9 @@ class Bumper : public rclcpp::Node {
       if (m_lidar2d_offset_initialized && m_lidar2d_sh.newMsg()) {
         const auto msg = m_lidar2d_sh.getMsg();
         std::vector<double> obstacle_sectors = find_obstacles_lidar2d(msg);
-        sensors_sectors.push_back({ObstacleSectors::SENSOR_LIDAR2D,
-                                   obstacle_sectors, msg->header.stamp});
+        const rclcpp::Time msg_stamp = rclcpp::Time(msg->header.stamp);
+        sensors_sectors.emplace_back(ObstacleSectors::SENSOR_LIDAR2D,
+                                     obstacle_sectors, msg_stamp);
         sensors_topics.push_back(m_lidar2d_sh.topicName());
       }
 
@@ -330,8 +386,9 @@ class Bumper : public rclcpp::Node {
         const auto msg = m_lidar1d_down_sh.getMsg();
         std::vector<double> obstacle_sectors =
             find_obstacles_lidar1d(msg, m_bottom_sector_idx);
-        sensors_sectors.push_back({ObstacleSectors::SENSOR_LIDAR1D,
-                                   obstacle_sectors, msg->header.stamp});
+        const rclcpp::Time msg_stamp = rclcpp::Time(msg->header.stamp);
+        sensors_sectors.emplace_back(ObstacleSectors::SENSOR_LIDAR1D,
+                                     obstacle_sectors, msg_stamp);
         sensors_topics.push_back(m_lidar1d_down_sh.topicName());
       }
 
@@ -340,8 +397,9 @@ class Bumper : public rclcpp::Node {
         const auto msg = m_lidar1d_up_sh.getMsg();
         std::vector<double> obstacle_sectors =
             find_obstacles_lidar1d(msg, m_top_sector_idx);
-        sensors_sectors.push_back({ObstacleSectors::SENSOR_LIDAR1D,
-                                   obstacle_sectors, msg->header.stamp});
+        const rclcpp::Time msg_stamp = rclcpp::Time(msg->header.stamp);
+        sensors_sectors.emplace_back(ObstacleSectors::SENSOR_LIDAR1D,
+                                     obstacle_sectors, msg_stamp);
         sensors_topics.push_back(m_lidar1d_up_sh.topicName());
       }
 
@@ -351,7 +409,7 @@ class Bumper : public rclcpp::Node {
                                         ObstacleSectors::OBSTACLE_NO_DATA);
       std::vector<int8_t> res_sensors(m_n_total_sectors,
                                       ObstacleSectors::SENSOR_NONE);
-      rclcpp::Time res_stamp = this->now();
+      rclcpp::Time res_stamp = clock->now();
       /* put the resuls from different sensors together //{ */
 
       for (const auto& sensor_sectors : sensors_sectors) {
@@ -422,9 +480,9 @@ class Bumper : public rclcpp::Node {
           ss << std::endl
              << "\t[" << used_sensors.at(it) << "] at topic \""
              << sensors_topics.at(it) << "\"";
-        RCLCPP_INFO_STREAM(
-            this->get_logger(),
-            "[Bumper]: Updating bumper using sensors:" << ss.str());
+        RCLCPP_INFO_STREAM_THROTTLE(
+            node->get_logger(), *clock, 2000,
+            "Updating bumper using sensors:" << ss.str());
       }
 
       //}
@@ -436,7 +494,8 @@ class Bumper : public rclcpp::Node {
        * stamp (for fallback timeout) //{ */
 
       if (!m_first_message_received && m_depthmap_sh.hasMsg()) {
-        m_first_message_stamp = m_depthmap_sh.getMsg()->header.stamp;
+        m_first_message_stamp =
+            rclcpp::Time(m_depthmap_sh.getMsg()->header.stamp);
         m_first_message_received = true;
       }
       if (!m_first_message_received && m_lidar3d_sh.hasMsg()) {
@@ -463,17 +522,18 @@ class Bumper : public rclcpp::Node {
       //}
 
       /* if the realsense timeout has run out, apply fallback values //{ */
-      const rclcpp::Duration cinfo_delay = this->now() - m_first_message_stamp;
-      if (m_first_message_received && cinfo_delay >= m_fallback_timeout) {
-        RCLCPP_WARN(
-            this->get_logger(),
-            "[%s]: No camera info message received after %.2f seconds, using "
-            "fallback number of horizontal sectors: %d!",
-            m_node_name.c_str(), cinfo_delay.seconds(),
-            m_fallback_n_horizontal_sectors);
-        initialize_sectors(m_fallback_n_horizontal_sectors,
-                           m_fallback_vertical_fov);
-        m_sectors_initialized = true;
+      if (m_first_message_received) {
+        const rclcpp::Duration cinfo_delay =
+            clock->now() - m_first_message_stamp;
+        if (cinfo_delay >= m_fallback_timeout) {
+          RCLCPP_WARN(node->get_logger(),
+                      "No camera info message received after %.2f seconds, "
+                      "using fallback number of horizontal sectors: %d!",
+                      cinfo_delay.seconds(), m_fallback_n_horizontal_sectors);
+          initialize_sectors(m_fallback_n_horizontal_sectors,
+                             m_fallback_vertical_fov);
+          m_sectors_initialized = true;
+        }
       }
       //}
       //}
@@ -516,6 +576,9 @@ class Bumper : public rclcpp::Node {
   //}
 
   /* ROS related variables (subscribers, timers etc.) //{ */
+  std::shared_ptr<mrs_lib::DynparamMgr> m_drmgr_ptr;
+  std::mutex mutex_drs_params_;
+  DynParams_t drs_params_;
 
   mrs_lib::SubscriberHandler<sensor_msgs::msg::Image> m_depthmap_sh;
   mrs_lib::SubscriberHandler<sensor_msgs::msg::CameraInfo> m_depth_cinfo_sh;
@@ -523,7 +586,6 @@ class Bumper : public rclcpp::Node {
   mrs_lib::SubscriberHandler<sensor_msgs::msg::LaserScan> m_lidar2d_sh;
   mrs_lib::SubscriberHandler<sensor_msgs::msg::Range> m_lidar1d_down_sh;
   mrs_lib::SubscriberHandler<sensor_msgs::msg::Range> m_lidar1d_up_sh;
-
   std::unique_ptr<tf2_ros::Buffer> m_tf_buffer;
   std::unique_ptr<tf2_ros::TransformListener> m_tf_listener_ptr;
 
@@ -534,10 +596,10 @@ class Bumper : public rclcpp::Node {
 
   rclcpp::TimerBase::SharedPtr m_main_loop_timer;
 
-  std::string m_node_name;
+  rclcpp::Node::SharedPtr node;
+  rclcpp::Clock::SharedPtr clock;
   //}
 
- private:
   // --------------------------------------------------------------
   // |                   Other member variables                   |
   // --------------------------------------------------------------
@@ -565,7 +627,6 @@ class Bumper : public rclcpp::Node {
 
   std::unique_ptr<mrs_lib::Transformer> m_tfm;
 
- private:
   // --------------------------------------------------------------
   // |                 Obstacle detection methods                 |
   // --------------------------------------------------------------
@@ -595,15 +656,18 @@ class Bumper : public rclcpp::Node {
 
     // dilate and erode the image if requested
     {
-      const int elem_a = 5;
-      const int elem_b = 5;
+      auto drs_params = mrs_lib::get_mutexed(mutex_drs_params_, drs_params_);
+      const int elem_a = drs_params.structuring_element_a;
+      const int elem_b = drs_params.structuring_element_b;
       cv::Mat element = cv::getStructuringElement(
           cv::MORPH_ELLIPSE, cv::Size(elem_a, elem_b), cv::Point(-1, -1));
-      cv::dilate(detect_im, detect_im, element, cv::Point(-1, -1), 1);
-      cv::erode(detect_im, detect_im, element, cv::Point(-1, -1), 1);
+      cv::dilate(detect_im, detect_im, element, cv::Point(-1, -1),
+                 drs_params.dilate_iterations);
+      cv::erode(detect_im, detect_im, element, cv::Point(-1, -1),
+                drs_params.erode_iterations);
 
       // erode without using zero (unknown) pixels
-      if (0 > 0) {
+      if (drs_params.erode_ignore_empty_iterations > 0) {
         cv::Mat unknown_as_max = detect_im;
         if (m_depthmap_unknown_pixel_value !=
             std::numeric_limits<uint16_t>::max()) {
@@ -611,16 +675,18 @@ class Bumper : public rclcpp::Node {
                                    std::numeric_limits<uint16_t>::max());
           detect_im.copyTo(unknown_as_max, known_pixels);
         }
-        cv::erode(unknown_as_max, detect_im, element, cv::Point(-1, -1), 0);
+        cv::erode(unknown_as_max, detect_im, element, cv::Point(-1, -1),
+                  drs_params.erode_ignore_empty_iterations);
       }
     }
     //}
 
     // TODO: filter out ground?
 
-    m_depthmap_hist_n_bins = 1000;
-    m_depthmap_hist_quantile_area = 200;
-    m_depthmap_max_depth = 10.0;
+    auto drs_params = mrs_lib::get_mutexed(mutex_drs_params_, drs_params_);
+    m_depthmap_hist_n_bins = drs_params.histogram_n_bins;
+    m_depthmap_hist_quantile_area = drs_params.histogram_quantile_area;
+    m_depthmap_max_depth = drs_params.max_depth;
 
     cv::Mat usable_pixels;
     if (m_depthmap_mask_im.empty())
@@ -643,8 +709,9 @@ class Bumper : public rclcpp::Node {
       /* Create and publish the debug image //{ */
       cv_bridge::CvImagePtr processed_depthmap_cvb = source_msg;
       processed_depthmap_cvb->image = detect_im;
-      sensor_msgs::msg::Image out_msg = *(processed_depthmap_cvb->toImageMsg());
-      m_processed_depthmap_pub.publish(out_msg);
+      sensor_msgs::msg::Image::ConstSharedPtr out_msg =
+          processed_depthmap_cvb->toImageMsg();
+      m_processed_depthmap_pub.publish(*out_msg);
       //}
     }
 
@@ -735,35 +802,24 @@ class Bumper : public rclcpp::Node {
 
   /* find_obstacles_pointcloud() method //{ */
   std::vector<double> find_obstacles_pointcloud(
-      const sensor_msgs::msg::PointCloud2::ConstSharedPtr& cloud_msg_ptr) {
+      const sensor_msgs::msg::PointCloud2::ConstSharedPtr& cloud_msg_in) {
     std::vector<double> ret(m_n_total_sectors,
                             ObstacleSectors::OBSTACLE_NO_DATA);
 
-    // Transform the pointcloud to m_frame_id before processing
-    sensor_msgs::msg::PointCloud2::ConstSharedPtr cloud_msg_transformed;
-    if (cloud_msg_ptr->header.frame_id != m_frame_id) {
-      const auto transformed_opt =
-          m_tfm->transformSingle(cloud_msg_ptr, m_frame_id);
-      if (!transformed_opt.has_value()) {
-        RCLCPP_WARN_THROTTLE(
-            this->get_logger(), *this->get_clock(), 1000,
-            "[Bumper]: Failed to transform pointcloud from '%s' to '%s'",
-            cloud_msg_ptr->header.frame_id.c_str(), m_frame_id.c_str());
-        return ret;
-      }
-      cloud_msg_transformed = transformed_opt.value();
-    } else {
-      cloud_msg_transformed = cloud_msg_ptr;
-    }
+    // Transform the incoming PointCloud2 to the desired frame first ??
+    auto cloud_tfd_opt = m_tfm->transformSingle(cloud_msg_in, m_frame_id);
+    if (cloud_tfd_opt == std::nullopt) return ret;
+    auto cloud_msg = cloud_tfd_opt.value();
 
-    auto cloud_orig = pcl::make_shared<pc_t>();
-    pcl::fromROSMsg(*cloud_msg_transformed, *cloud_orig);
-    auto cloud = pcl::make_shared<pc_t>();
+    // Convert to PCL point cloud
+    auto cloud = std::make_shared<pc_t>();
+    pcl::fromROSMsg(*cloud_msg, *cloud);
 
-    // reduce the number of points using VoxelGrid (output to cloud)
+    /* reduce the number of points using VoxelGrid (output to cloud) //{ */
+
     {
       pcl::VoxelGrid<pt_t> vg;
-      vg.setInputCloud(cloud_orig);
+      vg.setInputCloud(cloud);
       vg.setMinimumPointsNumberPerVoxel(m_lidar3d_voxel_minpoints);
       vg.setLeafSize(m_lidar3d_voxel_size, m_lidar3d_voxel_size,
                      m_lidar3d_voxel_size);
@@ -808,15 +864,18 @@ class Bumper : public rclcpp::Node {
       }
     }
 
-    sensor_msgs::msg::PointCloud2 cloud_msg;
-    pcl::toROSMsg(*cloud, cloud_msg);
-    cloud_msg.header = cloud_msg_transformed->header;
-    m_lidar3d_processed.publish(cloud_msg);
+    //}
+
+    sensor_msgs::msg::PointCloud2 processed_msg;
+    pcl::toROSMsg(*cloud, processed_msg);
+    m_lidar3d_processed.publish(processed_msg);
 
     for (const auto& el : *cloud) {
       const vec3_t ray(el.x, el.y, el.z);
       const auto [sector, dist] = sector_obstacle(ray);
+      // if the obstacle isn't in any sector, skip the point
       if (sector < 0) continue;
+      // otherwise, replace the minimum in the result list, if applicable
       auto& cur = ret.at(sector);
       if (cur == ObstacleSectors::OBSTACLE_NO_DATA || cur > dist) cur = dist;
     }
@@ -825,7 +884,6 @@ class Bumper : public rclcpp::Node {
   }
   //}
 
- private:
   // --------------------------------------------------------------
   // |                       Helper methods                       |
   // --------------------------------------------------------------
@@ -899,21 +957,19 @@ class Bumper : public rclcpp::Node {
     if (m_depthmap_roi_centering) {
       if (m_depthmap_roi.height == 0) m_depthmap_roi.height = img_height;
       if (m_depthmap_roi.height > img_height) {
-        RCLCPP_ERROR(
-            this->get_logger(),
-            "[%s]: Desired ROI height (%d) is larger than image height (%d) - "
-            "clamping!",
-            m_node_name.c_str(), m_depthmap_roi.height, img_height);
+        RCLCPP_ERROR(node->get_logger(),
+                     "Desired ROI height (%d) is larger than image height (%d) "
+                     "- clamping!",
+                     m_depthmap_roi.height, img_height);
         m_depthmap_roi.height = img_height;
       }
 
       if (m_depthmap_roi.width == 0) m_depthmap_roi.width = img_width;
       if (m_depthmap_roi.width > img_width) {
-        RCLCPP_ERROR(
-            this->get_logger(),
-            "[%s]: Desired ROI width (%d) is larger than image width (%d) - "
-            "clamping!",
-            m_node_name.c_str(), m_depthmap_roi.width, img_width);
+        RCLCPP_ERROR(node->get_logger(),
+                     "Desired ROI width (%d) is larger than image width (%d) - "
+                     "clamping!",
+                     m_depthmap_roi.width, img_width);
         m_depthmap_roi.width = img_width;
       }
 
@@ -963,7 +1019,7 @@ class Bumper : public rclcpp::Node {
   /* initialize_lidar2d_offset() method //{ */
   // initializes an angle offset of a 2D LiDAR using transforms
   void initialize_lidar2d_offset(
-      sensor_msgs::msg::LaserScan::ConstSharedPtr lidar2d_msg) {
+      const sensor_msgs::msg::LaserScan::ConstSharedPtr& lidar2d_msg) {
     geometry_msgs::msg::Vector3Stamped x_lidar;
     x_lidar.header = lidar2d_msg->header;
     x_lidar.vector.x = 1.0;
@@ -1003,7 +1059,7 @@ class Bumper : public rclcpp::Node {
   // | ----------- helper methods for median filtering ---------- |
   /* get_median() method //{ */
   template <typename T>
-  T get_median(const boost::circular_buffer<T>& buffer) {
+  static T get_median(const boost::circular_buffer<T>& buffer) {
     // copy the buffer to a helper vector
     std::vector<T> data;
     data.reserve(buffer.size());
@@ -1014,7 +1070,7 @@ class Bumper : public rclcpp::Node {
     // get the nth element (that's the median)
     const T median = *(std::begin(data) + data.size() / 2);
     if (std::isinf(median))
-      RCLCPP_WARN(this->get_logger(), "[Bumper]: median is inf...");
+      RCLCPP_WARN(rclcpp::get_logger("Bumper"), "median is inf...");
     return median;
   }
   //}
