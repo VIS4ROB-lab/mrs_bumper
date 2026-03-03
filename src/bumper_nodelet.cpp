@@ -3,6 +3,8 @@
 /* headers //{ */
 
 // clang: MatousFormat
+#include <cv_bridge/cv_bridge.h>
+#include <image_geometry/pinhole_camera_model.h>
 #include <mrs_lib/dynparam_mgr.h>
 #include <mrs_lib/geometry/cyclic.h>
 #include <mrs_lib/mutex.h>
@@ -21,8 +23,6 @@
 
 #include <algorithm>
 #include <boost/circular_buffer.hpp>
-#include <cv_bridge/cv_bridge.hpp>
-#include <image_geometry/pinhole_camera_model.hpp>
 #include <image_transport/image_transport.hpp>
 #include <mrs_msgs/msg/histogram.hpp>
 #include <mrs_msgs/msg/obstacle_sectors.hpp>

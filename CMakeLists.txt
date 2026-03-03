@@ -11,6 +11,7 @@ set(DEPENDENCIES
   cv_bridge
   geometry_msgs
   cv_bridge
+  image_geometry
   image_transport
   mrs_lib
   mrs_msgs
