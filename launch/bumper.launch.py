@@ -1,60 +1,232 @@
+#!/usr/bin/env python3
+
 import os
-from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, GroupAction
-from launch.substitutions import LaunchConfiguration, EnvironmentVariable
-from launch_ros.actions import Node, ComposableNodeContainer
-from launch_ros.descriptions import ComposableNode
 from ament_index_python.packages import get_package_share_directory
 
+import launch
+from launch.actions import DeclareLaunchArgument
+from launch.conditions import IfCondition, UnlessCondition
+from launch.substitutions import (
+    EnvironmentVariable,
+    IfElseSubstitution,
+    LaunchConfiguration,
+    PathJoinSubstitution,
+    PythonExpression,
+)
+
+from launch_ros.actions import ComposableNodeContainer, LoadComposableNodes
+from launch_ros.descriptions import ComposableNode
 
 def generate_launch_description():
 
-    # Declare launch arguments
-    uav_name_arg = DeclareLaunchArgument(
-        "uav_name",
-        default_value=EnvironmentVariable("UAV_NAME", default_value="uav"),
-        description="UAV name"
+    ld = launch.LaunchDescription()
+
+    pkg_name = 'mrs_bumper'
+    this_pkg_path = get_package_share_directory(pkg_name)
+    namespace = 'bumper'
+
+    # #{ uav_name
+
+    uav_name = LaunchConfiguration('uav_name')
+
+    ld.add_action(DeclareLaunchArgument(
+        'uav_name',
+        default_value=os.getenv('UAV_NAME', 'uav1'),
+        description='The uav name used for namespacing.',
+    ))
+
+    # #} end of uav_name
+
+    # #{ run_type
+
+    run_type = LaunchConfiguration('run_type')
+
+    ld.add_action(DeclareLaunchArgument(
+        'run_type',
+        default_value=os.getenv('RUN_TYPE', 'realworld'),
+        description='The run type used for configuration.',
+    ))
+
+    # #} end of run_type
+
+    # #{ standalone
+
+    standalone = LaunchConfiguration('standalone')
+
+    declare_standalone = DeclareLaunchArgument(
+        'standalone',
+        default_value='true',
+        description='Whether to start a as a standalone or load into an existing container.'
     )
 
-    fcu_horizontal_frame_arg = DeclareLaunchArgument(
-        "fcu_horizontal_frame",
-        default_value=[LaunchConfiguration("uav_name"), "/fcu_untilted"],
-        description="FCU horizontal frame ID"
+    ld.add_action(declare_standalone)
+
+    # #} end of standalone
+
+    # #{ fcu_frame
+
+    ld.add_action(DeclareLaunchArgument(
+        'fcu_frame',
+        default_value=PathJoinSubstitution([uav_name, 'fcu']),
+        description='The fcu frame used for configuration.',
+    ))
+
+    # #} end of fcu_frame
+
+    # #{ fcu_horizontal_frame
+
+    fcu_horizontal_frame = LaunchConfiguration('fcu_horizontal_frame')
+
+    ld.add_action(DeclareLaunchArgument(
+        'fcu_horizontal_frame',
+        default_value=PathJoinSubstitution([uav_name, 'fcu_untilted']),
+        description='The fcu horizontal frame used for configuration.',
+    ))
+
+    # #} end of fcu_horizontal_frame
+
+    # #{ container_name
+
+    container_name = LaunchConfiguration('container_name')
+
+    declare_container_name = DeclareLaunchArgument(
+        'container_name',
+        default_value='',
+        description='Name of an existing container to load into (if standalone is false)'
     )
 
-    # Get package share directory
-    mrs_bumper_dir = get_package_share_directory("mrs_bumper")
+    ld.add_action(declare_container_name)
 
-    # Create bumper node
-    bumper_node = Node(
-        package="mrs_bumper",
-        executable="mrs_bumper_node",
-        name="bumper",
-        output="screen",
-        namespace=LaunchConfiguration("uav_name"),
+    # #} end of container_name
+
+    # #{ ignore_mask
+
+    ld.add_action(DeclareLaunchArgument(
+        'ignore_mask',
+        default_value=os.getenv('IGNORE_MASK', 'true'),
+        description='Controls mask_filename argument.',
+    ))
+
+    # #} end of ignore_mask
+
+    # #{ mask_filename
+
+    mask_filename = LaunchConfiguration('mask_filename')
+
+    ld.add_action(DeclareLaunchArgument(
+        'mask_filename',
+        default_value=IfElseSubstitution(
+            condition=LaunchConfiguration('ignore_mask'),
+            if_value='',
+            else_value=this_pkg_path + '/masks/realsense_f550_mask.bmp'
+        ),
+        description='The mask filename to be used.',
+    ))
+
+    # #} end of mask_filename
+
+    # #{ custom_config
+
+    custom_config = LaunchConfiguration('custom_config')
+
+    # this adds the args to the list of args available for this launch files
+    # these args can be listed at runtime using -s flag
+    # default_value is required to if the arg is supposed to be optional at launch time
+    ld.add_action(DeclareLaunchArgument(
+        'custom_config',
+        default_value='',
+        description="Path to the custom configuration file. The path can be absolute, starting with '/' or relative to the current working directory",
+    ))
+
+    # behaviour:
+    #     custom_config == "" => custom_config: ""
+    #     custom_config == "/<path>" => custom_config: "/<path>"
+    #     custom_config == "<path>" => custom_config: "$(pwd)/<path>"
+    custom_config = IfElseSubstitution(
+        condition=PythonExpression(['"', custom_config, '" != "" and ', 'not "', custom_config, '".startswith("/")']),
+        if_value=PathJoinSubstitution([EnvironmentVariable('PWD'), custom_config]),
+        else_value=custom_config
+    )
+
+    # #} end of custom_config
+
+    # #{ use_sim_time
+
+    use_sim_time = LaunchConfiguration('use_sim_time')
+
+    ld.add_action(DeclareLaunchArgument(
+        'use_sim_time',
+        default_value=os.getenv('USE_SIM_TIME', 'false'),
+        description='Should the node subscribe to sim time?',
+    ))
+
+    # #} end of use_sim_time
+
+    # #{ log_level
+
+    ld.add_action(DeclareLaunchArgument(name='log_level', default_value='info'))
+
+    ld.add_action(DeclareLaunchArgument(name='topic_namespace', default_value=''))
+
+    # #} end of log_level
+
+    # #{ default node
+
+    default_node = ComposableNode(
+        package=pkg_name,
+        plugin=pkg_name+'::Bumper',
+        namespace=uav_name,
+        name=namespace,
+
         parameters=[
-            os.path.join(mrs_bumper_dir, "config/realworld.yaml"),
-            {
-                "uav_name": LaunchConfiguration("uav_name"),
-                "frame_id": LaunchConfiguration("fcu_horizontal_frame"),
-            }
+            {'uav_name': uav_name},
+            {'path_to_mask': mask_filename},
+            {'frame_id': fcu_horizontal_frame},
+            {'use_sim_time': use_sim_time},
+            {'config': PathJoinSubstitution([this_pkg_path, 'config', PythonExpression(['"', run_type, '" + ".yaml"'])])},
+            {'custom_config': custom_config},
         ],
+
         remappings=[
-            ("lidar3d_in", ["/", LaunchConfiguration("uav_name"), "/livox/lidar"]),
-            ("obstacle_sectors_out", "obstacle_sectors"),
-        ]
+            # Laser rangefinder topics
+            ("~/lidar1d_down_in", "hw_api/distance_sensor"),
+            ("~/lidar1d_up_in", "garmin_up/range"),
+            # Other input topics
+            ("~/depthmap_in", "front_rgbd/aligned_depth_to_color/image_raw"),
+            ("~/depth_cinfo_in", "front_rgbd/aligned_depth_to_color/camera_info"),
+            ("~/lidar3d_in", "ouster/points"), # os_cloud_nodelet/points
+            ("~/lidar2d_in", "rplidar/scan"),
+            # Output topics
+            ("~/obstacle_sectors_out", "~/obstacle_sectors"),
+        ],
     )
 
-    # Histogram displayer node
-    histogram_node = Node(
-        package="mrs_bumper",
-        executable="histogram_displayer",
-        name="histogram_displayer",
-        output="screen",
+    load_into_existing = LoadComposableNodes(
+        target_container=container_name,
+        composable_node_descriptions=[default_node],
+        condition=UnlessCondition(standalone)
     )
 
-    return LaunchDescription([
-        uav_name_arg,
-        fcu_horizontal_frame_arg,
-        bumper_node,
-    ])
+    ld.add_action(load_into_existing)
+
+    # #} end of default node
+
+    # #{ standalone container
+
+    standalone_container = ComposableNodeContainer(
+        namespace=uav_name,
+        name=namespace+'_container',
+        package='rclcpp_components',
+        executable='component_container_mt',
+        output='screen',
+        arguments=['--ros-args', '--log-level', LaunchConfiguration('log_level')],
+        # prefix=['debug_roslaunch ' + os.ttyname(sys.stdout.fileno())],
+        composable_node_descriptions=[default_node],
+        condition=IfCondition(standalone)
+    )
+
+    ld.add_action(standalone_container)
+
+    # #} end of standalone container
+
+    return ld
