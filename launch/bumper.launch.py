@@ -189,13 +189,13 @@ def generate_launch_description():
 
         remappings=[
             # Laser rangefinder topics
-            ("~/lidar1d_down_in", ""),
-            ("~/lidar1d_up_in", ""),
+            ("~/lidar1d_down_in", "hw_api/distance_sensor"),
+            ("~/lidar1d_up_in", "garmin_up/range"),
             # Other input topics
-            ("~/depthmap_in", ""),
-            ("~/depth_cinfo_in", ""),
-            ("~/lidar3d_in", "livox/lidar"), # os_cloud_nodelet/points
-            ("~/lidar2d_in", ""),
+            ("~/depthmap_in", "front_rgbd/aligned_depth_to_color/image_raw"),
+            ("~/depth_cinfo_in", "front_rgbd/aligned_depth_to_color/camera_info"),
+            ("~/lidar3d_in", "livox/lidar"), 
+            ("~/lidar2d_in", "rplidar/scan"),
             # Output topics
             ("~/obstacle_sectors_out", "~/obstacle_sectors"),
         ],
