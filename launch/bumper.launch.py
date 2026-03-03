@@ -18,7 +18,7 @@ def generate_launch_description():
 
     fcu_horizontal_frame_arg = DeclareLaunchArgument(
         "fcu_horizontal_frame",
-        default_value=LaunchConfiguration("uav_name") + "/fcu_untilted",
+        default_value=[LaunchConfiguration("uav_name"), "/fcu_untilted"],
         description="FCU horizontal frame ID"
     )
 
@@ -40,7 +40,7 @@ def generate_launch_description():
             }
         ],
         remappings=[
-            ("lidar3d_in", "/" + LaunchConfiguration("uav_name") + "/livox/lidar"),
+            ("lidar3d_in", ["/", LaunchConfiguration("uav_name"), "/livox/lidar"]),
             ("obstacle_sectors_out", "~obstacle_sectors"),
         ]
     )
