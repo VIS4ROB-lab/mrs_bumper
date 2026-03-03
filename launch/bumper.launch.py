@@ -41,7 +41,7 @@ def generate_launch_description():
         ],
         remappings=[
             ("lidar3d_in", ["/", LaunchConfiguration("uav_name"), "/livox/lidar"]),
-            ("obstacle_sectors_out", "~obstacle_sectors"),
+            ("obstacle_sectors_out", "obstacle_sectors"),
         ]
     )
 
